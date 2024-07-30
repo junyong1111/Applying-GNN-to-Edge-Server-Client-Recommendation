@@ -16,7 +16,7 @@ class CloudServer:
         self.latency = {h: max(1, min(100, np.random.normal(20, 5))) for h in range(24)}
 
     def get_features(self, hour):
-        return [self.cpu_usage[hour], self.bandwidth[hour], self.latency[hour]]
+        return [self.cpu_usage[hour], self.bandwidth[hour], self.latency[hour], hour]
 
 class Device:
     def __init__(self, id, cpu, bw, delay, loss, self_processing_power):
@@ -48,7 +48,7 @@ def create_network(num_clouds, num_devices):
     cloud_servers = [CloudServer(i+1, random.uniform(0.5, 0.8), random.uniform(500, 800)) for i in range(num_clouds)]
     devices = [Device(i+1, random.uniform(0.1, 0.5), random.uniform(10, 100), 
                       random.uniform(1, 50), random.uniform(0, 5),
-                      random.uniform(0.1, 0.3))  # 자체 처리 능력을 낮게 설정
+                      random.uniform(0.1, 0.3))
                for i in range(num_devices)]
     
     topo = CustomTopo(cloud_servers, devices)
@@ -65,7 +65,14 @@ def get_network_activity(hour):
     return activity[hour]
 
 def measure_performance(net, src, dst):
+    dst.cmd('iperf -s &')
+    time.sleep(1)
+		
     iperf_result = src.cmd(f'iperf -c {dst.IP()} -t 5')
+    band_result = net.iperf([src, dst])
+    print(f"band_string is {band_result[0]}")
+    print(f"iperf result between {src} and {dst} : {iperf_result}")
+    dst.cmd('kill %iperf')
     bandwidth = 0.0
     match = re.search(r'(\d+(\.\d+)?) ([MGK])bits/sec', iperf_result)
     if match:
@@ -103,6 +110,7 @@ def select_best_cloud(net, device, cloud_servers, cloud_loads, hour):
     activity = get_network_activity(hour)
     
     for cloud in cloud_servers:
+        cloud_id_with_hour = f'cloud{cloud.id}_hour{hour}'
         bandwidth, delay, loss = measure_performance(net, net.get(f'device{device.id}'), net.get(f'cloud{cloud.id}'))
         rating = calculate_rating(bandwidth, delay, loss)
         performance_score = (bandwidth / 100) - (delay / 100) - (loss / 10)
@@ -111,7 +119,7 @@ def select_best_cloud(net, device, cloud_servers, cloud_loads, hour):
         if total_load == 0:
             load_score = 1
         else:
-            load_score = 1 - (cloud_loads[cloud.id] / total_load)
+            load_score = 1 - (cloud_loads.get(cloud_id_with_hour, 0) / total_load)
         
         if activity > 0.7:
             score = performance_score * 0.4 + load_score * 0.6
@@ -120,17 +128,17 @@ def select_best_cloud(net, device, cloud_servers, cloud_loads, hour):
         
         if score > best_score:
             best_score = score
-            best_entity = cloud
+            best_entity = (cloud, hour)
             best_rating = rating
             best_bandwidth = bandwidth
             best_delay = delay
             best_loss = loss
 
     # 최악의 상황에서만 'self' 선택
-    self_score = device.self_processing_power - (device.cpu * 0.2)
+    self_score = device.self_processing_power - (device.cpu * 0.5)
     self_rating = calculate_rating(device.bandwidth, device.delay, device.loss)
     
-    if self_score > best_score and best_rating < 1.0:  # 매우 낮은 rating일 때만 self 선택
+    if self_score > best_score and best_rating < 2.0:  # 매우 낮은 rating일 때만 self 선택
         best_entity = 'self'
         best_rating = self_rating
         best_bandwidth = device.bandwidth
@@ -154,7 +162,7 @@ def save_characteristics(devices, cloud_servers):
         for cloud in cloud_servers:
             row = [cloud.id]
             for h in range(24):
-                row.extend(cloud.get_features(h))
+                row.extend(cloud.get_features(h)[:3])  # Exclude hour from features
             writer.writerow(row)
 
     print("Device and cloud characteristics saved to CSV files.")
@@ -162,11 +170,11 @@ def save_characteristics(devices, cloud_servers):
 def run_simulation(net, cloud_servers, devices, duration=1440, interval=10):
     print("Starting network simulation...")
     start_time = time.time()
-    cloud_loads = {cloud.id: 0 for cloud in cloud_servers}
+    cloud_loads = {}
     
     with open('simulation_results.csv', 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Timestamp', 'Hour', 'Device', 'Selected Entity', 'Bandwidth', 'Delay', 'Loss', 'Rating',
+        writer.writerow(['Timestamp', 'Hour', 'Device', 'Selected Entity', 'Selected Hour', 'Bandwidth', 'Delay', 'Loss', 'Rating',
                          'Device CPU', 'Device BW', 'Device Delay', 'Device Loss', 'Device Self Processing',
                          'Cloud CPU Usage', 'Cloud BW', 'Cloud Latency', 'Network Activity'])
         
@@ -184,20 +192,22 @@ def run_simulation(net, cloud_servers, devices, duration=1440, interval=10):
                 
                 if best_entity == 'self':
                     selected_entity = 'self'
-                    cloud_features = [0, 0, 0]  # 자체 처리 시 클라우드 특성은 0으로 설정
+                    selected_hour = -1
+                    cloud_features = [0, 0, 0]
                 else:
-                    selected_entity = f'cloud{best_entity.id}'
-                    cloud_loads[best_entity.id] += 1
-                    cloud_features = best_entity.get_features(simulated_hour)
+                    selected_cloud, selected_hour = best_entity
+                    selected_entity = f'cloud{selected_cloud.id}'
+                    cloud_id_with_hour = f'{selected_entity}_hour{selected_hour}'
+                    cloud_loads[cloud_id_with_hour] = cloud_loads.get(cloud_id_with_hour, 0) + 1
+                    cloud_features = selected_cloud.get_features(selected_hour)[:3]  # Exclude hour from features
                 
                 device_features = device.get_features()
                 
-                row = [current_time, simulated_hour, f'device{device.id}', selected_entity,
+                row = [current_time, simulated_hour, f'device{device.id}', selected_entity, selected_hour,
                        bandwidth, delay, loss, rating] + device_features + cloud_features + [activity]
                 writer.writerow(row)
                 
-                print(f"  Device {device.id} connected to {selected_entity} - Bandwidth: {bandwidth:.2f}, Delay: {delay:.2f}, Loss: {loss:.2f}, Rating: {rating:.2f}")
-                print(f"  Saved row: {row}")
+                print(f"  Device {device.id} connected to {selected_entity} at hour {selected_hour} - Bandwidth: {bandwidth:.2f}, Delay: {delay:.2f}, Loss: {loss:.2f}, Rating: {rating:.2f}")
             
             print(f"Cloud loads after cycle {cycle_count}: {cloud_loads}")
             print(f"Time elapsed: {current_time:.2f} seconds")
